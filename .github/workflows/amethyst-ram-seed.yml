@@ -51,7 +51,7 @@ jobs:
           set -euo pipefail
           sw_vers
           python3 --version
-          hdiutil version | head -1
+          hdiutil info | head -2 || true
           mkdir -p work output
 
       - name: Fetch and verify the pinned packer
