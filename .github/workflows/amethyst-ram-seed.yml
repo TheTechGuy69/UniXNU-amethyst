@@ -1,0 +1,209 @@
+name: Amethyst RAM Data seed
+
+# One self-contained job (no run ids, no downloaded earlier artifacts, no upstream artifact names):
+#   original OS image (pinned) -> APFS Data volume (2 GiB, RAM-only) -> pack -> [watchdog-unavailable override] -> [Setup skipped]
+# and three packed seeds come out: clean, watchdog, skipsetup (watchdog + Setup skipped). Each is verified by attaching it READ-ONLY.
+# The result is encrypted with this repository's ARTIFACT_PASSPHRASE environment secret (the seed is an Apple-derived /private/var,
+# artifacts of a public repository are not private); a small public seed-public.json (UUID, hashes, sizes) travels beside it.
+# Decrypt and verify on the PC with scripts/seed/decrypt-verify-seed.py. Nothing here touches a phone.
+#
+# The APFS volume UUID is RANDOM per run (hdiutil create). It is read from the image, passed to the edit scripts with --volume-uuid
+# and recorded in seed-public.json; the kernel configuration (CONFIG_XNU_OWNER_DATA_VOLUME_UUID) must be set from that file, never assumed.
+# The watchdog override is a temporary bring-up workaround (see scripts/log/disable-watchdog-seed.py): it gives no watchdog protection.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: macOS runner image (upstream's data-seed job used macos-14)
+        type: choice
+        options: [macos-14, macos-15, macos-15-intel]
+        default: macos-14
+
+permissions:
+  contents: read
+
+concurrency:
+  group: amethyst-ram-seed-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  seed:
+    runs-on: ${{ inputs.runner || 'macos-14' }}
+    # ARTIFACT_PASSPHRASE is a secret of the environment of the same name (not a repository secret), as for gpu-addon.yml
+    environment: ARTIFACT_PASSPHRASE
+    timeout-minutes: 120
+    env:
+      IPSW_URL: https://updates.cdn-apple.com/2025SpringFCS/fullrestores/122-77166/DCA6CFE8-90E9-4B92-880D-3DE171798E40/iPad_Pro_HFR_17.7.11_21H461_Restore.ipsw
+      OS_MEMBER: 044-76040-038.dmg
+      OS_DMG_SHA256: 3f99b859c9728379110b66657c7b15285bcb1925ad8b5726542e2cdcf8b1028d
+      LAUNCHD_SHA256: 8cec9a3c44a443b08e977ccc5d577850316ad428c575dc01f09b018dbd5b6a25
+      PACKER_URL: https://raw.githubusercontent.com/UniXNU/DarwinBoot/3325e352d7df68a9f9ad74832ed94a6acbbd7390/Test/packed_ramdisk.py
+      PACKER_SHA256: efb5fac21ae94dcb1aecd47da2b73a7112b487e43692ac6396858552d27a0e48
+    steps:
+      - name: Check out the device repository (the edit scripts)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+          sw_vers
+          python3 --version
+          hdiutil version | head -1
+          mkdir -p work output
+
+      - name: Fetch and verify the pinned packer
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 --output work/packed_ramdisk.py "$PACKER_URL"
+          echo "$PACKER_SHA256  work/packed_ramdisk.py" | shasum -a 256 -c -
+
+      - name: Fetch and verify the original OS image
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 --retry-delay 10 --connect-timeout 30 --output work/firmware.ipsw "$IPSW_URL"
+          unzip -p work/firmware.ipsw "$OS_MEMBER" > work/original-os.dmg
+          echo "$OS_DMG_SHA256  work/original-os.dmg" | shasum -a 256 -c -
+          rm work/firmware.ipsw
+
+      - name: Create the clean RAM Data seed (2 GiB APFS, raw)
+        run: |
+          set -euo pipefail
+          mkdir -p work/os-mount work/data-mount
+          OS="$PWD/work/os-mount"
+          DATA="$PWD/work/data-mount"
+          cleanup() {
+            hdiutil detach "$DATA" || true
+            hdiutil detach "$OS" || true
+          }
+          trap cleanup EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$OS" work/original-os.dmg
+          echo "$LAUNCHD_SHA256  $OS/sbin/launchd" | shasum -a 256 -c -
+          hdiutil create -size 2g -layout NONE -fs APFS -volname OwnerData -type UDTO work/owner-data.cdr
+          hdiutil attach -nobrowse -owners on -mountpoint "$DATA" work/owner-data.cdr
+          # Exclude before writing: deleting after the copy leaves nonzero APFS blocks that zero-page packing cannot discard.
+          sudo /usr/bin/tar -C "$OS/private/var" --exclude='./staged_system_apps' -cpf - . |
+            sudo /usr/bin/tar -C "$DATA" -xpf -
+          test ! -e "$DATA/staged_system_apps"
+          sudo mkdir -p "$DATA/keybags" "$DATA/mobile/tmp" "$DATA/tmp" "$DATA/run"
+          sudo chmod 1777 "$DATA/tmp"
+          diskutil info -plist "$DATA" > work/volume-info.plist
+          sync
+          hdiutil detach "$DATA"
+          hdiutil detach "$OS"
+          trap - EXIT
+          rm work/original-os.dmg
+          UUID=$(python3 -c "import plistlib,sys; print(plistlib.load(open('work/volume-info.plist','rb'))['VolumeUUID'].upper())")
+          echo "SEED_UUID=$UUID" >> "$GITHUB_ENV"
+          python3 - <<'PY'
+          import os
+          p = 'work/owner-data.cdr'
+          with open(p, 'rb') as f:
+              assert f.read(36)[32:36] == b'NXSB', 'expected a raw APFS container, not a partitioned image'
+          assert os.path.getsize(p) == 2 * 1024**3
+          PY
+          echo "clean seed APFS volume UUID: $UUID"
+
+      - name: Pack the clean seed
+        run: |
+          set -euo pipefail
+          python3 work/packed_ramdisk.py work/owner-data.cdr output/seed-clean.packed | tee work/pack-clean.json
+          ls -l output/seed-clean.packed
+
+      - name: Self-checks of the edit scripts
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/log/disable-watchdog-seed.py --check
+          sudo python3 scripts/log/skip-setup-seed.py --check
+
+      - name: Watchdog-unavailable override on a copy (temporary, reversible)
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/log/disable-watchdog-seed.py output/seed-clean.packed output/seed-watchdog.packed \
+            --packer "$PWD/work/packed_ramdisk.py" --volume-uuid "$SEED_UUID"
+          sudo chown -R "$(id -u):$(id -g)" output
+
+      - name: Skip Setup on a copy of the watchdog seed
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/log/skip-setup-seed.py output/seed-watchdog.packed output/seed-skipsetup.packed \
+            --packer "$PWD/work/packed_ramdisk.py" --volume-uuid "$SEED_UUID"
+          sudo chown -R "$(id -u):$(id -g)" output
+          mkdir -p work/edit-logs
+          cp output/*.json work/edit-logs/ 2>/dev/null || true
+
+      - name: Verify the three seeds (attached read-only)
+        run: |
+          set -euo pipefail
+          sudo python3 scripts/seed/verify-seed-macos.py --packer "$PWD/work/packed_ramdisk.py" --uuid "$SEED_UUID" \
+            --json work/verify.json \
+            clean=output/seed-clean.packed:clean watchdog=output/seed-watchdog.packed:watchdog skipsetup=output/seed-skipsetup.packed:skipsetup
+          sudo chown -R "$(id -u):$(id -g)" work output
+
+      - name: Write seed-public.json and the checksums
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          verify = json.loads(Path('work/verify.json').read_text())
+          def blob(path):
+              return subprocess.run(['git', 'hash-object', path], capture_output=True, text=True, check=True).stdout.strip()
+          record = dict(
+              schema=1,
+              purpose='RAM-only iPadOS 17.7.11 (21H461) Data seeds for the amethyst port; volatile, rebuilt on every boot, no persistence',
+              volume_uuid=os.environ['SEED_UUID'],
+              kernel_config='CONFIG_XNU_OWNER_DATA_VOLUME_UUID="%s" and CONFIG_XNU_OWNER_DATA_MOUNT=y' % os.environ['SEED_UUID'],
+              source=dict(ipsw_url=os.environ['IPSW_URL'], os_member=os.environ['OS_MEMBER'], os_dmg_sha256=os.environ['OS_DMG_SHA256'],
+                          launchd_sha256=os.environ['LAUNCHD_SHA256']),
+              packer=dict(url=os.environ['PACKER_URL'], sha256=os.environ['PACKER_SHA256']),
+              seeds=verify,
+              scripts={p: blob(p) for p in ('scripts/log/disable-watchdog-seed.py', 'scripts/log/skip-setup-seed.py',
+                                           'scripts/seed/verify-seed-macos.py', '.github/workflows/amethyst-ram-seed.yml')},
+              github=dict(run_id=os.environ['GITHUB_RUN_ID'], run_number=os.environ['GITHUB_RUN_NUMBER'], commit=os.environ['GITHUB_SHA'],
+                          repository=os.environ['GITHUB_REPOSITORY'], runner_image=os.environ.get('ImageVersion', ''), runner_os=os.environ.get('ImageOS', '')),
+              notes=['the watchdog override only tells launchd not to run watchdogd/watchdog; it is NOT watchdog protection and is temporary',
+                     'hardware_tested is false until the owner has booted each seed'],
+              hardware_tested=False)
+          Path('output/seed-public.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps({k: record[k] for k in ('volume_uuid', 'kernel_config')}, indent=2))
+          PY
+          (cd output && shasum -a 256 seed-clean.packed seed-watchdog.packed seed-skipsetup.packed seed-watchdog.packed.json seed-skipsetup.packed.json seed-public.json > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Encrypt
+        env:
+          ARTIFACT_PASSPHRASE: ${{ secrets.ARTIFACT_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          [ -n "$ARTIFACT_PASSPHRASE" ] || { echo "::error::No ARTIFACT_PASSPHRASE secret: nothing is uploaded."; exit 1; }
+          mkdir -p "$RUNNER_TEMP/encrypted"
+          tar -C output -czf - seed-clean.packed seed-watchdog.packed seed-skipsetup.packed seed-watchdog.packed.json seed-skipsetup.packed.json seed-public.json SHA256SUMS \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:ARTIFACT_PASSPHRASE \
+              -out "$RUNNER_TEMP/encrypted/ram-seed.tar.gz.enc"
+          cp output/seed-public.json "$RUNNER_TEMP/encrypted/seed-public.json"
+          (cd "$RUNNER_TEMP/encrypted" && shasum -a 256 ram-seed.tar.gz.enc seed-public.json | tee SHA256SUMS-encrypted)
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: amethyst-ram-seed-encrypted
+          path: |
+            ${{ runner.temp }}/encrypted/ram-seed.tar.gz.enc
+            ${{ runner.temp }}/encrypted/seed-public.json
+            ${{ runner.temp }}/encrypted/SHA256SUMS-encrypted
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: amethyst-ram-seed-logs
+          path: |
+            work/pack-clean.json
+            work/verify.json
+            work/volume-info.plist
+          if-no-files-found: ignore
+          retention-days: 7

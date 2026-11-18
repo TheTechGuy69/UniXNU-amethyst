@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """macOS only: create a temporary watchdog-disabled copy of a packed RAM Data seed.
 
-Usage: disable-watchdog-seed.py INPUT OUTPUT --packer /path/to/packed_ramdisk.py
+Usage: disable-watchdog-seed.py INPUT OUTPUT --packer /path/to/packed_ramdisk.py [--volume-uuid UUID]
+--volume-uuid: the APFS volume UUID the kernel configuration expects (default: upstream's seed, A173DCC8-...). A seed made by
+a fresh `hdiutil create` has its own UUID; pass it (from seed.json) so the check still guards against editing the wrong image.
 Never edits the input or opens a physical disk. Revert by using the original seed.
 Remove this bring-up override when a real watchdog backend is available.
 """
@@ -17,6 +19,9 @@ import sys
 import tempfile
 
 
+DEFAULT_VOLUME_UUID = 'A173DCC8-1F31-46ED-9F67-DB2A68FC25DE'
+
+
 def disable_jobs(data):
     if not isinstance(data, dict):
         raise ValueError('launchd disabled.plist must be a dictionary')
@@ -28,8 +33,10 @@ def main():
     parser.add_argument('input', type=Path, nargs='?')
     parser.add_argument('output', type=Path, nargs='?')
     parser.add_argument('--packer', type=Path)
+    parser.add_argument('--volume-uuid', default=DEFAULT_VOLUME_UUID)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    args.volume_uuid = str(__import__('uuid').UUID(args.volume_uuid)).upper()
     if args.check:
         original = {'other.job': False, 'com.apple.watchdogd': False}
         changed = disable_jobs(plistlib.loads(plistlib.dumps(original)))
@@ -76,7 +83,7 @@ def main():
     try:
         info = plistlib.loads(subprocess.check_output(['diskutil', 'info', '-plist', str(mount)]))
         volume_uuid = info['VolumeUUID']
-        if volume_uuid != 'A173DCC8-1F31-46ED-9F67-DB2A68FC25DE':
+        if volume_uuid != args.volume_uuid:
             raise ValueError('unexpected seed volume UUID; kernel configuration must not change')
         policy = mount / 'db/com.apple.xpc.launchd/disabled.plist'
         if policy.is_symlink():

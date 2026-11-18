@@ -2,7 +2,8 @@
 """macOS only: copy a packed RAM Data seed with Setup marked done, so SpringBoard
 starts instead of the "Press home to upgrade" Setup page.
 
-Usage: skip-setup-seed.py INPUT OUTPUT --packer /path/to/packed_ramdisk.py
+Usage: skip-setup-seed.py INPUT OUTPUT --packer /path/to/packed_ramdisk.py [--volume-uuid UUID]
+       (--volume-uuid: the UUID the kernel configuration expects; default upstream's seed A173DCC8-...)
        skip-setup-seed.py --check
 
 Preference values are those of UniXNU scripts/seed-data-skip-setup.py
@@ -190,8 +191,10 @@ def main():
     parser.add_argument('input', type=Path, nargs='?')
     parser.add_argument('output', type=Path, nargs='?')
     parser.add_argument('--packer', type=Path)
+    parser.add_argument('--volume-uuid', default=VOLUME_UUID)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
+    args.volume_uuid = str(__import__('uuid').UUID(args.volume_uuid)).upper()
     if args.check:
         return check()
     if not args.input or not args.output or not args.packer:
@@ -224,12 +227,12 @@ def main():
         raise RuntimeError('unexpected mounts; refusing to edit')
     try:
         info = plistlib.loads(subprocess.check_output(['diskutil', 'info', '-plist', str(mount)]))
-        if info['VolumeUUID'] != VOLUME_UUID:
+        if info['VolumeUUID'] != args.volume_uuid:
             raise ValueError('unexpected seed volume UUID; kernel configuration must not change')
         written, created = write_preferences(mount)
         disabled = disable_jobs(mount)
         after = plistlib.loads(subprocess.check_output(['diskutil', 'info', '-plist', str(mount)]))
-        assert after['VolumeUUID'] == VOLUME_UUID
+        assert after['VolumeUUID'] == args.volume_uuid
     finally:
         subprocess.run(['hdiutil', 'detach', str(mount)], check=True)
     if raw.read_bytes()[32:36] != b'NXSB':
@@ -237,7 +240,7 @@ def main():
     subprocess.run([sys.executable, str(args.packer.resolve()), str(raw),
                     str(args.output.resolve())], check=True)
     args.output.with_suffix(args.output.suffix + '.json').write_text(json.dumps({
-        'input': str(args.input.resolve()), 'volume_uuid': VOLUME_UUID,
+        'input': str(args.input.resolve()), 'volume_uuid': args.volume_uuid,
         'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
         'output_sha256': hashlib.sha256(args.output.read_bytes()).hexdigest(),
         'ram_only': True, 'hardware_tested': False, 'build': BUILD,
