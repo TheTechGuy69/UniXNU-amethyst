@@ -56,9 +56,26 @@ DISABLED_JOBS = ('com.apple.identityservicesd', 'com.apple.locationd', 'com.appl
                  'com.apple.bluetoothd', 'com.apple.telephonyutilities.callservicesd',
                  # Run 2 (v2): these crash and respawn every 10s; their spam pushes the first
                  # 220s (SpringBoard start) out of the 128 KiB log window. Unknown labels are ignored.
-                 'com.apple.fitcored', 'com.apple.liveactivitiesd', 'com.apple.privacyaccountingd',
+                 'com.apple.liveactivitiesd', 'com.apple.privacyaccountingd',
                  'com.apple.ScreenTimeAgent', 'com.apple.dmd', 'com.apple.assistantd',
-                 'com.apple.biomesyncd', 'com.apple.biomed')
+                 'com.apple.biomesyncd', 'com.apple.biomed') + (
+                 # touch5: every label below was read from the Label key of a plist in the 21H461 root image
+                 # (044-76040-038.dmg System/Library/LaunchDaemons). The old 'com.apple.fitcored' entry was wrong (no such label),
+                 # which is why fitcored kept crash-looping; the real label is com.apple.fitcore.
+                 # Crash loops in touch3-5/touch4 (fitcored 15, fitnesscoachingd 14, UsageTrackingAgent 16 .ips):
+                 'com.apple.fitcore', 'com.apple.fitcore.session', 'com.apple.fitnesscoachingd', 'com.apple.UsageTrackingAgent',
+                 # OTA / software update (mobileassetd stays: fonts and other assets depend on it):
+                 'com.apple.OTATaskingAgent', 'com.apple.OTACrashCopier', 'com.apple.mobile.softwareupdated',
+                 'com.apple.softwareupdateservicesd',
+                 # Apple Pencil: 21H461 has no Pencil-only daemon (pairing is bluetoothd, already off). Accessory firmware
+                 # updates and Scribble handwriting only; accessoryd itself stays.
+                 'com.apple.accessoryupdaterd', 'com.apple.handwritingd',
+                 # Non-essential Siri (assistant_service stays):
+                 'com.apple.assistant_cdmd', 'com.apple.siriactionsd', 'com.apple.siriinferenced', 'com.apple.siriknowledged',
+                 'com.apple.sirittsd', 'com.apple.SiriTTSTrainingAgent', 'com.apple.siri.sirireaderd',
+                 # Analytics (ReportCrash, osanalyticshelper and diagnosticd stay: the boot logs need them):
+                 'com.apple.analyticsd', 'com.apple.audioanalyticsd', 'com.apple.geoanalyticsd', 'com.apple.wifianalyticsd',
+                 'com.apple.tipsd')
 # GPU compositing (amethyst v48/v49): with the Metal plugin published, backboardd allocated Apple-compressed
 # framebuffers ('b3a8', two planes), which the GOP display path cannot scan out, so every swap failed verify_swap
 # and the screen stayed black. UniXNU add-gpu-plugin-data.py --publish and make-data-seed.py set these three for
@@ -67,7 +84,20 @@ CA_FRAMEBUFFER = {'CAEnableDeepFramebuffer': False, 'CAEnableFramebufferCompress
                   'CAEnableIOSurfaceCompression': False}
 for _domain in ('backboardd', '.GlobalPreferences'):
     PREFERENCES[_domain] = dict(CA_FRAMEBUFFER)
+# touch5: accessibility (mobile domain com.apple.Accessibility; keys and domain string sit together in libAccessibility's
+# cstrings in the 21H461 dyld cache). Bold Text off: with it on, SpringBoard SIGSEGVs in CI::GLContext (CUIShapeEffectStack
+# sharedCIContext needs a GPU) and resprings forever (touch4, 13 .ips). Reduce Motion and Reduce Transparency on (less SW rendering).
+# Corner gestures are NOT set: the domain and "off" value of SBBottom{Left,Right}CornerGesture* are unverified.
+PREFERENCES['com.apple.Accessibility'] = {
+    'EnhancedTextLegibilityEnabled': False,       # Bold Text
+    'ReduceMotionEnabled': True,                  # Reduce Motion
+    'EnhancedBackgroundContrastEnabled': True}    # Reduce Transparency
 CONTAINERS = ('Bundle', 'Data/System', 'Shared/SystemGroup', 'Temp')
+# touch3-4: tzinit (/usr/libexec/tzinit) looks for the timezone dataset at /var/db/timezone/zoneinfo. The seed has only
+# db/timezone/localtime (-> /var/db/timezone/zoneinfo/US/Pacific), so every first boot took tzinit's "Unable to locate data; resetting to
+# system partition" path, which must write this link (force_system_dataset). With it present, the first boot needs no tzinit write.
+# The root image's /usr/share/zoneinfo -> /var/db/timezone/zoneinfo and /usr/share/zoneinfo.default exists there (21H461).
+TIMEZONE_LINKS = {'db/timezone/zoneinfo': '/usr/share/zoneinfo.default'}
 
 
 def merged(previous, values):
@@ -97,6 +127,32 @@ def disable_jobs(var):
     marker.chmod(0o644)
     assert plistlib.loads(policy.read_bytes()) == data
     return sorted(k for k, v in data.items() if v)
+
+
+def timezone_links(var):
+    """Create the TIMEZONE_LINKS symlinks (root:wheel, like the rest of /private/var/db). An existing link with the same target is kept;
+    anything else at that path, or a symlinked parent, is refused (never followed)."""
+    made = {}
+    for rel, target in TIMEZONE_LINKS.items():
+        path = var / rel
+        parent = path.parent
+        for part in (var / 'db', parent):
+            if part.is_symlink():
+                raise ValueError(f'refusing symlink {part}')
+        if not parent.is_dir():
+            raise ValueError(f'seed has no {parent.relative_to(var)}; wrong base image')
+        if path.is_symlink():
+            if os.readlink(path) != target:
+                raise ValueError(f'{rel} already links to {os.readlink(path)}, not {target}')
+        elif path.exists():
+            raise ValueError(f'{rel} exists and is not a symlink; refusing')
+        else:
+            os.symlink(target, path)
+            made[rel] = target
+        if os.geteuid() == 0:
+            os.lchown(path, 0, 0)
+        assert os.readlink(path) == target
+    return made
 
 
 def write_preferences(var):
@@ -183,7 +239,26 @@ def check():
                 plistlib.dumps({'com.apple.watchdogd': True, 'other': False}))
             jobs = disable_jobs(var)
             assert 'com.apple.watchdogd' in jobs and 'com.apple.locationd' in jobs and 'other' not in jobs
-    print('PASS: Setup preferences merged; existing keys preserved')
+    with tempfile.TemporaryDirectory() as td:
+        var = Path(td)
+        (var / 'db/timezone').mkdir(parents=True)
+        os.symlink('/var/db/timezone/zoneinfo/US/Pacific', var / 'db/timezone/localtime')
+        assert timezone_links(var) == {'db/timezone/zoneinfo': '/usr/share/zoneinfo.default'}
+        assert timezone_links(var) == {}                                   # idempotent: an equal link is kept
+        assert os.readlink(var / 'db/timezone/localtime') == '/var/db/timezone/zoneinfo/US/Pacific'   # untouched
+        os.remove(var / 'db/timezone/zoneinfo'); os.symlink('/elsewhere', var / 'db/timezone/zoneinfo')
+        try:
+            timezone_links(var)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError('accepted a different zoneinfo link')
+    assert len(DISABLED_JOBS) == len(set(DISABLED_JOBS)), 'duplicate disabled job'
+    assert 'com.apple.fitcored' not in DISABLED_JOBS and 'com.apple.fitcore' in DISABLED_JOBS
+    for keep in ('com.apple.ReportCrash', 'com.apple.osanalytics.osanalyticshelper', 'com.apple.diagnosticd', 'com.apple.mobileassetd'):
+        assert keep not in DISABLED_JOBS, keep
+    assert PREFERENCES['com.apple.Accessibility']['EnhancedTextLegibilityEnabled'] is False
+    print('PASS: Setup preferences merged; existing keys preserved; timezone link created once, idempotent, conflicts refused')
 
 
 def main():
@@ -231,6 +306,7 @@ def main():
             raise ValueError('unexpected seed volume UUID; kernel configuration must not change')
         written, created = write_preferences(mount)
         disabled = disable_jobs(mount)
+        tzlinks = timezone_links(mount)
         after = plistlib.loads(subprocess.check_output(['diskutil', 'info', '-plist', str(mount)]))
         assert after['VolumeUUID'] == args.volume_uuid
     finally:
@@ -244,7 +320,7 @@ def main():
         'input_sha256': hashlib.sha256(args.input.read_bytes()).hexdigest(),
         'output_sha256': hashlib.sha256(args.output.read_bytes()).hexdigest(),
         'ram_only': True, 'hardware_tested': False, 'build': BUILD,
-        'preferences': written, 'containers_created': created, 'disabled_jobs': disabled,
+        'preferences': written, 'containers_created': created, 'disabled_jobs': disabled, 'timezone_links': tzlinks,
         'source': 'UniXNU scripts/seed-data-skip-setup.py 12c5d44 --no-auto-dim',
         'work_directory': str(work),
     }, indent=2) + '\n')

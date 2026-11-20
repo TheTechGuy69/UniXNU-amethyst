@@ -15,10 +15,10 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: macOS runner image (upstream's data-seed job used macos-14)
+        description: macOS runner image (macos-14 is no longer supported on hosted runners)
         type: choice
-        options: [macos-14, macos-15, macos-15-intel]
-        default: macos-14
+        options: [macos-15, macos-15-intel, macos-26]
+        default: macos-15
 
 permissions:
   contents: read
@@ -29,7 +29,7 @@ concurrency:
 
 jobs:
   seed:
-    runs-on: ${{ inputs.runner || 'macos-14' }}
+    runs-on: ${{ inputs.runner || 'macos-15' }}
     # ARTIFACT_PASSPHRASE is a secret of the environment of the same name (not a repository secret), as for gpu-addon.yml
     environment: ARTIFACT_PASSPHRASE
     timeout-minutes: 120
@@ -51,7 +51,7 @@ jobs:
           set -euo pipefail
           sw_vers
           python3 --version
-          hdiutil info | head -2 || true
+          hdiutil help 2>&1 | head -1 || true
           mkdir -p work output
 
       - name: Fetch and verify the pinned packer
