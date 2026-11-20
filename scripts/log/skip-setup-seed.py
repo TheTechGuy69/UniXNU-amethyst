@@ -86,11 +86,13 @@ for _domain in ('backboardd', '.GlobalPreferences'):
     PREFERENCES[_domain] = dict(CA_FRAMEBUFFER)
 # touch5: accessibility (mobile domain com.apple.Accessibility; keys and domain string sit together in libAccessibility's
 # cstrings in the 21H461 dyld cache). Bold Text off: with it on, SpringBoard SIGSEGVs in CI::GLContext (CUIShapeEffectStack
-# sharedCIContext needs a GPU) and resprings forever (touch4, 13 .ips). Reduce Motion and Reduce Transparency on (less SW rendering).
-# Corner gestures are NOT set: the domain and "off" value of SBBottom{Left,Right}CornerGesture* are unverified.
+# sharedCIContext needs a GPU) and resprings forever (touch4, 13 .ips). Reduce Transparency on (no blur until the GPU).
+# touch6 (owner): Reduce Motion OFF (animations wanted; touch5 had it on).
+# Corner gestures are NOT set: the "off" values of SBCornerGestureDefaults' SBBottom{Left,Right}CornerGesture* are unverified.
+# Settings > Accessibility crashes in the same CoreImage GL path (MobileIcons _MI_sharedIconCompositorContext, touch5); no daemon is involved.
 PREFERENCES['com.apple.Accessibility'] = {
     'EnhancedTextLegibilityEnabled': False,       # Bold Text
-    'ReduceMotionEnabled': True,                  # Reduce Motion
+    'ReduceMotionEnabled': False,                 # Reduce Motion
     'EnhancedBackgroundContrastEnabled': True}    # Reduce Transparency
 CONTAINERS = ('Bundle', 'Data/System', 'Shared/SystemGroup', 'Temp')
 # touch3-4: tzinit (/usr/libexec/tzinit) looks for the timezone dataset at /var/db/timezone/zoneinfo. The seed has only
@@ -258,6 +260,8 @@ def check():
     for keep in ('com.apple.ReportCrash', 'com.apple.osanalytics.osanalyticshelper', 'com.apple.diagnosticd', 'com.apple.mobileassetd'):
         assert keep not in DISABLED_JOBS, keep
     assert PREFERENCES['com.apple.Accessibility']['EnhancedTextLegibilityEnabled'] is False
+    assert PREFERENCES['com.apple.Accessibility']['ReduceMotionEnabled'] is False
+    assert PREFERENCES['com.apple.Accessibility']['EnhancedBackgroundContrastEnabled'] is True
     print('PASS: Setup preferences merged; existing keys preserved; timezone link created once, idempotent, conflicts refused')
 
 
